@@ -2,3 +2,5 @@ benchmark
 jerasure/*
 gf-complete/*
 *.csv
+*.png
+*.py

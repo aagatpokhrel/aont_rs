@@ -15,7 +15,7 @@
 
 #define W 8 // GF(2^8) as used in the paper
 // 10 MB base data size
-#define DATA_SIZE (10 * 1024 * 1024)
+#define DATA_SIZE (2 * 1024 * 1024)
 
 // --- TIMING HELPER ---
 double get_time_diff(struct timespec start, struct timespec end) {
@@ -85,11 +85,10 @@ void aont_secure(unsigned char *data, size_t data_len, unsigned char *output_pkg
     memcpy(output_pkg + data_len, canary, 32);
 }
 
-// --- ISOLATED BENCHMARK FUNCTION (ALIGNMENT SAFE) ---
 void run_benchmark(int k, int n, double *results) {
     int m = n - k;
     
-    // 1. Calculate Strictly Aligned Block Sizes for SIMD
+    // 1. Calculate Strictly Aligned Block Sizes
     int block_size = DATA_SIZE / k;
     if (block_size % 64 != 0) {
         block_size += 64 - (block_size % 64);
@@ -114,30 +113,31 @@ void run_benchmark(int k, int n, double *results) {
     char **data_ptrs = malloc(k * sizeof(char*));
     char **coding_ptrs = malloc(n * sizeof(char*)); 
     
-    // Allocate coding pointers to the largest possible size we will need
+    // Allocate coding pointers to the largest possible size we will need (aont_block_size)
     for(int i=0; i<n; i++) {
         posix_memalign((void**)&coding_ptrs[i], 64, aont_block_size);
     }
 
     struct timespec start, end;
+    double time_taken;
     int *matrix;
 
     // ---------------------------------------------------------
-    // 1. Shamir's Simulation (Dense N x K Matrix)
+    // 1. Shamir
     // ---------------------------------------------------------
     for(int i=0; i<k; i++) data_ptrs[i] = (char*)original_data + (i * block_size);
     matrix = reed_sol_vandermonde_coding_matrix(k, n, W); 
     
     clock_gettime(CLOCK_MONOTONIC, &start);
     jerasure_matrix_encode(k, n, W, matrix, data_ptrs, coding_ptrs, block_size);
-    emulate_storage_nodes(data_ptrs, coding_ptrs, k, n, block_size); // Shamir uses N for coding rows
+    emulate_storage_nodes(data_ptrs, coding_ptrs, k, n, block_size);
     clock_gettime(CLOCK_MONOTONIC, &end);
     
     results[0] = (DATA_SIZE / 1048576.0) / get_time_diff(start, end);
     free(matrix);
 
     // ---------------------------------------------------------
-    // 2. Rabin's IDA (Systematic RS)
+    // 2. Rabin
     // ---------------------------------------------------------
     matrix = reed_sol_vandermonde_coding_matrix(k, m, W);
     
