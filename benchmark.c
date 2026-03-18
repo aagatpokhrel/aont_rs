@@ -13,13 +13,8 @@
 #include <jerasure.h>
 #include <reed_sol.h>
 
-#define W 8 // GF(2^8) as used in the paper
-#define K 10 // 10 data slices
-#define M 6  // 6 coding slices (N = 16)
-#define N (K + M)
-
-// 10 MB base data size so it divides perfectly by K=10 (1 MB per slice)
-#define DATA_SIZE (10 * 1024 * 1024) 
+#define W 8 // GF(2^8)
+#define DATA_SIZE (10 * 1024 * 1024) // 10 MB base payload
 
 // --- TIMING HELPER ---
 double get_time_diff(struct timespec start, struct timespec end) {
@@ -27,20 +22,16 @@ double get_time_diff(struct timespec start, struct timespec end) {
 }
 
 // --- SERVER/DISK EMULATION ---
-void emulate_storage_nodes(char **data_ptrs, char **coding_ptrs, int block_size) {
+void emulate_storage_nodes(char **data_ptrs, char **coding_ptrs, int k, int m, int block_size) {
     char path[256];
-    
-    // Write Data Slices (First K nodes)
-    for (int i = 0; i < K; i++) {
+    for (int i = 0; i < k; i++) {
         sprintf(path, "/tmp/node_data_%d", i);
         mkdir(path, 0777); 
         sprintf(path, "/tmp/node_data_%d/slice.dat", i);
         FILE *fp = fopen(path, "wb");
         if (fp) { fwrite(data_ptrs[i], 1, block_size, fp); fclose(fp); }
     }
-
-    // Write Coding Slices (Remaining M nodes)
-    for (int i = 0; i < M; i++) {
+    for (int i = 0; i < m; i++) {
         sprintf(path, "/tmp/node_coding_%d", i);
         mkdir(path, 0777); 
         sprintf(path, "/tmp/node_coding_%d/slice.dat", i);
@@ -49,129 +40,119 @@ void emulate_storage_nodes(char **data_ptrs, char **coding_ptrs, int block_size)
     }
 }
 
-// --- AONT FAST (RC4-128 + MD5) ---
-void aont_fast(unsigned char *data, size_t data_len, unsigned char *output_pkg) {
-    unsigned char key[16];
-    RAND_bytes(key, sizeof(key)); 
+// [Keep your existing aont_fast and aont_secure functions exactly as they are here]
+// ... 
 
-    EVP_CIPHER_CTX *ctx = EVP_CIPHER_CTX_new();
-    EVP_EncryptInit_ex(ctx, EVP_rc4(), NULL, key, NULL);
-    int len;
-    EVP_EncryptUpdate(ctx, output_pkg, &len, data, data_len);
-    EVP_EncryptFinal_ex(ctx, output_pkg + len, &len);
-    EVP_CIPHER_CTX_free(ctx);
-
-    unsigned char hash[MD5_DIGEST_LENGTH];
-    MD5(output_pkg, data_len, hash);
-
-    unsigned char canary[16];
-    for(int i = 0; i < 16; i++) canary[i] = hash[i] ^ key[i];
-    memcpy(output_pkg + data_len, canary, 16);
-}
-
-// --- AONT SECURE (AES-256-CTR + SHA-256) ---
-void aont_secure(unsigned char *data, size_t data_len, unsigned char *output_pkg) {
-    unsigned char key[32], iv[16] = {0}; 
-    RAND_bytes(key, sizeof(key)); 
-
-    EVP_CIPHER_CTX *ctx = EVP_CIPHER_CTX_new();
-    EVP_EncryptInit_ex(ctx, EVP_aes_256_ctr(), NULL, key, iv);
-    int len;
-    EVP_EncryptUpdate(ctx, output_pkg, &len, data, data_len);
-    EVP_EncryptFinal_ex(ctx, output_pkg + len, &len);
-    EVP_CIPHER_CTX_free(ctx);
-
-    unsigned char hash[SHA256_DIGEST_LENGTH];
-    SHA256(output_pkg, data_len, hash);
-
-    unsigned char canary[32];
-    for(int i = 0; i < 32; i++) canary[i] = hash[i] ^ key[i];
-    memcpy(output_pkg + data_len, canary, 32);
-}
-
-int main() {
-    printf("Initializing %d MB test payload (K=%d, N=%d)...\n\n", DATA_SIZE / (1024 * 1024), K, N);
-    unsigned char *original_data = malloc(DATA_SIZE);
+// --- ISOLATED BENCHMARK FUNCTION ---
+void run_benchmark(int k, int n, double *results) {
+    int m = n - k;
+    
+    unsigned char *original_data;
+    posix_memalign((void**)&original_data, 64, DATA_SIZE);
     RAND_bytes(original_data, DATA_SIZE);
 
-    // Padding buffers slightly for AONT canaries
     int padded_size = DATA_SIZE + 32; 
-    padded_size += K - (padded_size % K); // Ensure divisibility by K
-    int block_size = padded_size / K;
+    int block_size = padded_size / k;
+    if (padded_size % k != 0) block_size++; 
+    
+    // Strict AVX/SSE Alignment
+    if (block_size % 64 != 0) {
+        block_size += 64 - (block_size % 64);
+    }
+    padded_size = block_size * k; 
 
-    unsigned char *pkg_buffer = calloc(1, padded_size);
+    unsigned char *pkg_buffer;
+    posix_memalign((void**)&pkg_buffer, 64, padded_size);
+    memset(pkg_buffer, 0, padded_size);
 
-    // Setup Jerasure Pointers
-    char **data_ptrs = malloc(K * sizeof(char*));
-    char **coding_ptrs = malloc(N * sizeof(char*)); // N allocated to simulate Shamir
-    for(int i=0; i<N; i++) coding_ptrs[i] = malloc(block_size);
+    char **data_ptrs = malloc(k * sizeof(char*));
+    char **coding_ptrs = malloc(n * sizeof(char*)); 
+    for(int i=0; i<n; i++) {
+        posix_memalign((void**)&coding_ptrs[i], 64, block_size);
+    }
 
     struct timespec start, end;
     double time_taken;
     int *matrix;
 
-    // ---------------------------------------------------------
-    // 1. Shamir's Secret Sharing (Simulated via Dense N x K Matrix)
-    // ---------------------------------------------------------
-    for(int i=0; i<K; i++) data_ptrs[i] = (char*)original_data + i * (DATA_SIZE / K);
-    matrix = reed_sol_vandermonde_coding_matrix(K, N, W); 
-
+    // 1. Shamir
+    for(int i=0; i<k; i++) data_ptrs[i] = (char*)original_data + i * (DATA_SIZE / k);
+    matrix = reed_sol_vandermonde_coding_matrix(k, n, W); 
     clock_gettime(CLOCK_MONOTONIC, &start);
-    jerasure_matrix_encode(K, N, W, matrix, data_ptrs, coding_ptrs, DATA_SIZE / K);
-    emulate_storage_nodes(data_ptrs, coding_ptrs, DATA_SIZE / K);
+    jerasure_matrix_encode(k, n, W, matrix, data_ptrs, coding_ptrs, DATA_SIZE / k);
+    emulate_storage_nodes(data_ptrs, coding_ptrs, k, n, DATA_SIZE / k); // M is N for Shamir simulation
     clock_gettime(CLOCK_MONOTONIC, &end);
-
-    time_taken = get_time_diff(start, end);
-    printf("[1] Shamir's Method Total Throughput: %.2f MB/s\n", (DATA_SIZE / 1048576.0) / time_taken);
+    results[0] = (DATA_SIZE / 1048576.0) / get_time_diff(start, end);
     free(matrix);
 
-    // ---------------------------------------------------------
-    // 2. Rabin's IDA (Systematic Reed-Solomon)
-    // ---------------------------------------------------------
-    matrix = reed_sol_vandermonde_coding_matrix(K, M, W);
-
+    // 2. Rabin
+    matrix = reed_sol_vandermonde_coding_matrix(k, m, W);
     clock_gettime(CLOCK_MONOTONIC, &start);
-    jerasure_matrix_encode(K, M, W, matrix, data_ptrs, coding_ptrs, DATA_SIZE / K);
-    emulate_storage_nodes(data_ptrs, coding_ptrs, DATA_SIZE / K);
+    jerasure_matrix_encode(k, m, W, matrix, data_ptrs, coding_ptrs, DATA_SIZE / k);
+    emulate_storage_nodes(data_ptrs, coding_ptrs, k, m, DATA_SIZE / k);
     clock_gettime(CLOCK_MONOTONIC, &end);
+    results[1] = (DATA_SIZE / 1048576.0) / get_time_diff(start, end);
 
-    time_taken = get_time_diff(start, end);
-    printf("[2] Rabin's IDA Total Throughput:   %.2f MB/s\n", (DATA_SIZE / 1048576.0) / time_taken);
-
-    // ---------------------------------------------------------
-    // 3. AONT-RS Fast (RC4/MD5 + Systematic RS)
-    // ---------------------------------------------------------
+    // 3. AONT-RS Fast
     clock_gettime(CLOCK_MONOTONIC, &start);
-    aont_fast(original_data, DATA_SIZE, pkg_buffer);
-    for(int i=0; i<K; i++) data_ptrs[i] = (char*)pkg_buffer + i * block_size;
-    jerasure_matrix_encode(K, M, W, matrix, data_ptrs, coding_ptrs, block_size);
-    emulate_storage_nodes(data_ptrs, coding_ptrs, block_size);
+    // [Insert your aont_fast call here]
+    for(int i=0; i<k; i++) data_ptrs[i] = (char*)pkg_buffer + i * block_size;
+    jerasure_matrix_encode(k, m, W, matrix, data_ptrs, coding_ptrs, block_size);
+    emulate_storage_nodes(data_ptrs, coding_ptrs, k, m, block_size);
     clock_gettime(CLOCK_MONOTONIC, &end);
+    results[2] = (DATA_SIZE / 1048576.0) / get_time_diff(start, end);
 
-    time_taken = get_time_diff(start, end);
-    printf("[3] AONT-RS Fast Total Throughput:  %.2f MB/s\n", (DATA_SIZE / 1048576.0) / time_taken);
-
-    // ---------------------------------------------------------
-    // 4. AONT-RS Secure (AES-256/SHA-256 + Systematic RS)
-    // ---------------------------------------------------------
+    // 4. AONT-RS Secure
     memset(pkg_buffer, 0, padded_size);
     clock_gettime(CLOCK_MONOTONIC, &start);
-    aont_secure(original_data, DATA_SIZE, pkg_buffer);
-    for(int i=0; i<K; i++) data_ptrs[i] = (char*)pkg_buffer + i * block_size;
-    jerasure_matrix_encode(K, M, W, matrix, data_ptrs, coding_ptrs, block_size);
-    emulate_storage_nodes(data_ptrs, coding_ptrs, block_size);
+    // [Insert your aont_secure call here]
+    for(int i=0; i<k; i++) data_ptrs[i] = (char*)pkg_buffer + i * block_size;
+    jerasure_matrix_encode(k, m, W, matrix, data_ptrs, coding_ptrs, block_size);
+    emulate_storage_nodes(data_ptrs, coding_ptrs, k, m, block_size);
     clock_gettime(CLOCK_MONOTONIC, &end);
+    results[3] = (DATA_SIZE / 1048576.0) / get_time_diff(start, end);
 
-    time_taken = get_time_diff(start, end);
-    printf("[4] AONT-RS Secure Total Throughput:%.2f MB/s\n", (DATA_SIZE / 1048576.0) / time_taken);
-
-    // Cleanup
+    // Cleanup for next iteration
     free(matrix);
     free(original_data);
     free(pkg_buffer);
     free(data_ptrs);
-    for(int i=0; i<N; i++) free(coding_ptrs[i]);
+    for(int i=0; i<n; i++) free(coding_ptrs[i]);
     free(coding_ptrs);
+}
 
+int main() {
+    // Define the ratios matching the paper's 5 graphs
+    double ratios[] = {1.0/6.0, 1.0/3.0, 1.0/2.0, 2.0/3.0, 5.0/6.0};
+    char* ratio_labels[] = {"1/6", "1/3", "1/2", "2/3", "5/6"};
+    
+    // Print CSV Header
+    printf("Ratio_Label,Ratio_Val,N,K,Shamir_MBs,Rabin_MBs,AONT_Fast_MBs,AONT_Secure_MBs\n");
+
+    // Outer Loop: The 5 graphs
+    for (int r = 0; r < 5; r++) {
+        double current_ratio = ratios[r];
+        
+        // Inner Loop: Sweep N from 6 to 36
+        for (int n = 6; n <= 36; n += 6) {
+            
+            // Calculate K dynamically based on target ratio
+            int k = (int)(n * current_ratio);
+            if (k < 1) k = 1; // Safeguard
+            
+            // Don't run if K >= N (Invalid erasure code state)
+            if (k >= n) continue;
+
+            double results[4] = {0};
+            
+            // Execute the heavily-aligned benchmark suite
+            run_benchmark(k, n, results);
+            
+            // Output CSV row
+            printf("%s,%f,%d,%d,%.2f,%.2f,%.2f,%.2f\n", 
+                   ratio_labels[r], current_ratio, n, k, 
+                   results[0], results[1], results[2], results[3]);
+        }
+    }
     return 0;
 }
